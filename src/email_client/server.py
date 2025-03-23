@@ -82,10 +82,13 @@ async def search_emails_async(mail: imaplib.IMAP4_SSL, search_criteria: str) -> 
     """Asynchronously search emails with timeout."""
     loop = asyncio.get_event_loop()
     try:
+        logging.debug(f"Searching emails with criteria: {search_criteria}")
         _, messages = await loop.run_in_executor(None, lambda: mail.search(None, search_criteria))
         if not messages[0]:
+            logging.debug("No emails found matching the search criteria")
             return []
             
+        logging.debug(f"Found {len(messages[0].split())} emails matching the criteria")
         email_list = []
         for num in messages[0].split()[:MAX_EMAILS]:  # Limit to MAX_EMAILS
             _, msg_data = await loop.run_in_executor(None, lambda: mail.fetch(num, '(RFC822)'))
@@ -93,15 +96,19 @@ async def search_emails_async(mail: imaplib.IMAP4_SSL, search_criteria: str) -> 
             
         return email_list
     except Exception as e:
+        logging.error(f"Error searching emails: {str(e)}")
         raise Exception(f"Error searching emails: {str(e)}")
 
 async def get_email_content_async(mail: imaplib.IMAP4_SSL, email_id: str) -> dict:
     """Asynchronously get full content of a specific email."""
     loop = asyncio.get_event_loop()
     try:
+        logging.debug(f"Fetching email content for ID: {email_id}")
         _, msg_data = await loop.run_in_executor(None, lambda: mail.fetch(email_id, '(RFC822)'))
+        logging.debug(f"Successfully fetched email content for ID: {email_id}")
         return format_email_content(msg_data)
     except Exception as e:
+        logging.error(f"Error fetching email content: {str(e)}")
         raise Exception(f"Error fetching email content: {str(e)}")
 
 async def count_emails_async(mail: imaplib.IMAP4_SSL, search_criteria: str) -> int:
@@ -165,6 +172,44 @@ async def send_email_async(
         logging.error(f"Error in send_email_async: {str(e)}")
         raise
 
+async def ensure_mailbox_selected(mail: imaplib.IMAP4_SSL, mailbox: str = "inbox") -> None:
+    """Ensure a mailbox is selected before performing IMAP operations."""
+    loop = asyncio.get_event_loop()
+    try:
+        logging.debug(f"Selecting mailbox: {mailbox}")
+        await loop.run_in_executor(None, lambda: mail.select(mailbox))
+        logging.debug(f"Successfully selected mailbox: {mailbox}")
+    except Exception as e:
+        logging.error(f"Error selecting mailbox {mailbox}: {str(e)}")
+        raise Exception(f"Error selecting mailbox: {str(e)}")
+
+async def list_folders_async(mail: imaplib.IMAP4_SSL) -> list[str]:
+    """Asynchronously list all available folders/mailboxes."""
+    loop = asyncio.get_event_loop()
+    try:
+        logging.debug("Listing all available folders")
+        # Get list of all folders
+        _, folder_list = await loop.run_in_executor(None, lambda: mail.list())
+        
+        # Parse folder names
+        folders = []
+        for folder in folder_list:
+            # Decode if bytes
+            if isinstance(folder, bytes):
+                folder = folder.decode('utf-8')
+            
+            # Extract folder name (format: b'(\\HasNoChildren) "/" "folder_name"')
+            parts = folder.split(' "', 1)
+            if len(parts) > 1:
+                folder_name = parts[1].strip('"')
+                folders.append(folder_name)
+        
+        logging.debug(f"Found {len(folders)} folders")
+        return folders
+    except Exception as e:
+        logging.error(f"Error listing folders: {str(e)}")
+        raise Exception(f"Error listing folders: {str(e)}")
+
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
     """
@@ -172,6 +217,14 @@ async def handle_list_tools() -> list[types.Tool]:
     Each tool specifies its arguments using JSON Schema validation.
     """
     return [
+        types.Tool(
+            name="list-folders",
+            description="List all available email folders/mailboxes in the email account",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
         types.Tool(
             name="search-emails",
             description="Search emails within a date range and/or with specific keywords",
@@ -192,8 +245,7 @@ async def handle_list_tools() -> list[types.Tool]:
                     },
                     "folder": {
                         "type": "string",
-                        "description": "Folder to search in ('inbox' or 'sent', defaults to 'inbox')",
-                        "enum": ["inbox", "sent"],
+                        "description": "Folder/mailbox to search in (defaults to 'inbox')",
                     },
                 },
             },
@@ -207,6 +259,10 @@ async def handle_list_tools() -> list[types.Tool]:
                     "email_id": {
                         "type": "string",
                         "description": "The ID of the email to retrieve",
+                    },
+                    "folder": {
+                        "type": "string",
+                        "description": "Folder/mailbox containing the email (defaults to 'inbox')",
                     },
                 },
                 "required": ["email_id"],
@@ -225,6 +281,10 @@ async def handle_list_tools() -> list[types.Tool]:
                     "end_date": {
                         "type": "string",
                         "description": "End date in YYYY-MM-DD format",
+                    },
+                    "folder": {
+                        "type": "string",
+                        "description": "Folder/mailbox to count emails in (defaults to 'inbox')",
                     },
                 },
                 "required": ["start_date", "end_date"],
@@ -314,13 +374,39 @@ async def handle_call_tool(
         mail = imaplib.IMAP4_SSL(EMAIL_CONFIG["imap_server"])
         mail.login(EMAIL_CONFIG["email"], EMAIL_CONFIG["password"])
         
-        if name == "search-emails":
-            # 选择文件夹
-            folder = arguments.get("folder", "inbox")  # 默认选择收件箱
-            if folder == "sent":
-                mail.select('"[Gmail]/Sent Mail"')  # 对于 Gmail
-            else:
-                mail.select("inbox")
+        if name == "list-folders":
+            try:
+                async with asyncio.timeout(SEARCH_TIMEOUT):
+                    folders = await list_folders_async(mail)
+                    
+                if not folders:
+                    return [types.TextContent(
+                        type="text",
+                        text="No folders found in the email account."
+                    )]
+                
+                # Format the results as a list
+                result_text = "Available email folders:\n\n"
+                for folder in folders:
+                    result_text += f"- {folder}\n"
+                
+                return [types.TextContent(
+                    type="text",
+                    text=result_text
+                )]
+                
+            except asyncio.TimeoutError:
+                return [types.TextContent(
+                    type="text",
+                    text="Operation timed out while listing folders."
+                )]
+                
+        elif name == "search-emails":
+            # Get folder parameter
+            folder = arguments.get("folder", "inbox")
+            
+            # Select the appropriate mailbox
+            await ensure_mailbox_selected(mail, folder)
             
             # Get optional parameters
             start_date = arguments.get("start_date")
@@ -334,10 +420,12 @@ async def handle_call_tool(
             else:
                 start_date = datetime.strptime(start_date, "%Y-%m-%d").strftime("%d-%b-%Y")
                 
+            # Always convert end_date to datetime object for consistent handling
             if not end_date:
-                end_date = datetime.now().strftime("%d-%b-%Y")
+                end_date_obj = datetime.now()
+                end_date = end_date_obj.strftime("%d-%b-%Y")
             else:
-                # Convert end_date to datetime object once
+                # Convert end_date to datetime object
                 end_date_obj = datetime.strptime(end_date, "%Y-%m-%d")
                 end_date = end_date_obj.strftime("%d-%b-%Y")
             
@@ -364,18 +452,18 @@ async def handle_call_tool(
                 if not email_list:
                     return [types.TextContent(
                         type="text",
-                        text="No emails found matching the criteria."
+                        text=f"No emails found in '{folder}' matching the criteria."
                     )]
                 
                 # Format the results as a table
-                result_text = "Found emails:\n\n"
+                result_text = f"Found emails in '{folder}':\n\n"
                 result_text += "ID | From | Date | Subject\n"
                 result_text += "-" * 80 + "\n"
                 
                 for email in email_list:
                     result_text += f"{email['id']} | {email['from']} | {email['date']} | {email['subject']}\n"
                 
-                result_text += "\nUse get-email-content with an email ID to view the full content of a specific email."
+                result_text += f"\nUse get-email-content with an email ID and folder='{folder}' to view the full content of a specific email."
                 
                 return [types.TextContent(
                     type="text",
@@ -390,6 +478,8 @@ async def handle_call_tool(
                 
         elif name == "get-email-content":
             email_id = arguments.get("email_id")
+            folder = arguments.get("folder", "inbox")
+            
             if not email_id:
                 return [types.TextContent(
                     type="text",
@@ -397,6 +487,9 @@ async def handle_call_tool(
                 )]
             
             try:
+                # Select specified mailbox before fetching email content
+                await ensure_mailbox_selected(mail, folder)
+                
                 async with asyncio.timeout(SEARCH_TIMEOUT):
                     email_content = await get_email_content_async(mail, email_id)
                     
@@ -422,8 +515,12 @@ async def handle_call_tool(
         elif name == "count-daily-emails":
             start_date = datetime.strptime(arguments["start_date"], "%Y-%m-%d")
             end_date = datetime.strptime(arguments["end_date"], "%Y-%m-%d")
+            folder = arguments.get("folder", "inbox")
             
-            result_text = "Daily email counts:\n\n"
+            # Select specified mailbox before counting emails
+            await ensure_mailbox_selected(mail, folder)
+            
+            result_text = f"Daily email counts in '{folder}':\n\n"
             result_text += "Date | Count\n"
             result_text += "-" * 30 + "\n"
             
@@ -452,7 +549,7 @@ async def handle_call_tool(
     except Exception as e:
         return [types.TextContent(
             type="text",
-            text=f"Error: {str(e)}"
+            text=f"Error: {str(e)}\n\nIf you see a state error, please try again. If the problem persists, check if:\n1. Your email credentials are correct\n2. Your email provider allows IMAP/SMTP access\n3. The server settings are correct"
         )]
     finally:
         try:
