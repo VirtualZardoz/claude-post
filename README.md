@@ -1,6 +1,15 @@
-# ClaudePost
+# ClaudePost (Enhanced Fork)
+
+> This is a fork of [ZilongXue/claude-post](https://github.com/ZilongXue/claude-post) with additional features and bug fixes.
 
 A Model Context Protocol (MCP) server that provides a seamless email management interface through Claude. This integration allows you to handle emails directly through natural language conversations with Claude, supporting features like searching, reading, and sending emails securely.
+
+## Enhancements in this Fork
+
+* 🔍 **Complete Folder Access**: Added ability to browse and search all email folders
+* 🛠️ **Bug Fixes**: Fixed IMAP state errors when fetching email content
+* 📋 **Improved Logging**: Enhanced logging for better troubleshooting
+* 🔄 **Robust Email Operations**: Better handling of mailbox selection across all operations
 
 ## Features & Demo
 
@@ -10,9 +19,9 @@ A Model Context Protocol (MCP) server that provides a seamless email management 
   <img src="assets/gif1.gif" width="800"/>
 </p>
 
-- 📧 Search emails by date range and keywords
-- 📅 View daily email statistics
-- 📝 Read full email content with threading support
+* 📧 Search emails by date range and keywords
+* 📅 View daily email statistics
+* 📝 Read full email content with threading support
 
 ### Email Composition and Sending
 
@@ -20,17 +29,17 @@ A Model Context Protocol (MCP) server that provides a seamless email management 
   <img src="assets/gif2.gif" width="800"/>
 </p>
 
-- ✉️ Send emails with CC recipients support
-- 🔒 Secure email handling with TLS
+* ✉️ Send emails with CC recipients support
+* 🔒 Secure email handling with TLS
 
 ## Prerequisites
 
-- Python 3.12 or higher
-- A Gmail account (or other email provider)
-- If using Gmail:
-  - Two-factor authentication enabled
-  - [App-specific password](https://support.google.com/mail/answer/185833?hl=en) generated
-- Claude Desktop application
+* Python 3.12 or higher
+* A Gmail account (or other email provider)
+* If using Gmail:
+  * Two-factor authentication enabled
+  * [App-specific password](https://support.google.com/mail/answer/185833?hl=en) generated
+* Claude Desktop application
 
 ## Setup
 
@@ -47,7 +56,7 @@ A Model Context Protocol (MCP) server that provides a seamless email management 
 
    ```bash
    # Clone the repository
-   git clone https://github.com/ZilongXue/claude-post.git
+   git clone https://github.com/YOUR-USERNAME/claude-post.git
    cd claude-post
 
    # Create and activate virtual environment
@@ -78,9 +87,10 @@ A Model Context Protocol (MCP) server that provides a seamless email management 
    # MacOS
    ~/Library/Application Support/Claude/claude_desktop_config.json
 
+   # Windows
+   %APPDATA%\Claude\claude_desktop_config.json
+
    # Create the file if it doesn't exist
-   mkdir -p ~/Library/Application\ Support/Claude
-   touch ~/Library/Application\ Support/Claude/claude_desktop_config.json
    ```
 
    Add the following configuration:
@@ -89,19 +99,35 @@ A Model Context Protocol (MCP) server that provides a seamless email management 
    {
      "mcpServers": {
        "email": {
-         "command": "/Users/username/.local/bin/uv",
+         "command": "python",
          "args": [
-           "--directory",
-           "/path/to/claude-post/src/email_client",
-           "run",
-           "email-client"
-         ]
+           "-m",
+           "email_client"
+         ],
+         "cwd": "/path/to/claude-post"
        }
      }
    }
    ```
 
-   Replace `/Users/username` and `/path/to/claude-post` with your actual paths.
+   Replace `/path/to/claude-post` with your actual path.
+   
+   For Windows, use a configuration like:
+   
+   ```json
+   {
+     "mcpServers": {
+       "email": {
+         "command": "C:/path/to/claude-post/.venv/Scripts/python.exe",
+         "args": [
+           "-m",
+           "email_client"
+         ],
+         "cwd": "C:/path/to/claude-post"
+       }
+     }
+   }
+   ```
 
    After updating the configuration, restart Claude Desktop for the changes to take effect.
 
@@ -109,35 +135,42 @@ A Model Context Protocol (MCP) server that provides a seamless email management 
 
 The server runs automatically through Claude Desktop:
 
-- The server will start when Claude launches if configured correctly
-- No manual server management needed
-- Server stops when Claude is closed
+* The server will start when Claude launches if configured correctly
+* No manual server management needed
+* Server stops when Claude is closed
 
 ## Usage Through Claude
 
 You can interact with your emails using natural language commands. Here are some examples:
 
+### View Folder Structure
+* "What folders are available in my email account?"
+* "List all my email folders"
+
 ### Search Emails
 
-- "Show me emails from last week"
-- "Find emails with subject containing 'meeting'"
-- "Search for emails from recruiting@linkedin.com between 2024-01-01 and 2024-01-07"
-- "Search sent emails from last month"
+* "Show me emails from last week"
+* "Find emails with subject containing 'meeting'"
+* "Search for emails from recruiting@linkedin.com between 2024-01-01 and 2024-01-07"
+* "Search sent emails from last month"
+* "Search for emails with keyword 'invoice' in my 'Archive' folder"
 
 ### Read Email Content
 
-- "Show me the content of email #12345"
-- "What's the full message of the last email from HR?"
+* "Show me the content of email #12345"
+* "What's the full message of the last email from HR?"
+* "Get the content of email #678 from the 'Projects' folder"
 
 ### Email Statistics
 
-- "How many emails did I receive today?"
-- "Show me daily email counts for the past week"
+* "How many emails did I receive today?"
+* "Show me daily email counts for the past week"
+* "Count emails in my 'Newsletters' folder from 2023-01-01 to 2023-01-31"
 
 ### Send Emails
 
-- "I want to send an email to john@example.com"
-- "Send a meeting confirmation to team@company.com"
+* "I want to send an email to john@example.com"
+* "Send a meeting confirmation to team@company.com"
 
 Note: For security reasons, Claude will always show you the email details for confirmation before actually sending.
 
@@ -159,8 +192,8 @@ claude-post/
 
 ## Security Notes
 
-- Use app-specific passwords instead of your main account password
-- For Gmail users:
+* Use app-specific passwords instead of your main account password
+* For Gmail users:
   1. Enable 2-Step Verification in your Google Account
   2. Generate an App Password for this application
   3. Use the App Password in your `.env` file
@@ -169,6 +202,19 @@ claude-post/
 
 The application logs detailed information to `email_client.log`. Check this file for debugging information and error messages.
 
+## Troubleshooting
+
+If you encounter issues:
+1. Check the `email_client.log` file for detailed error messages
+2. Ensure your email server supports IMAP and SMTP access
+3. Verify your credentials in the `.env` file
+4. Make sure the proper mailbox is selected before operations
+
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Acknowledgements
+
+* Original project by [ZilongXue](https://github.com/ZilongXue/claude-post)
+* Uses the [Model Context Protocol (MCP)](https://github.com/anthropics/anthropic-cookbook/tree/main/mcp) for integration with Claude
