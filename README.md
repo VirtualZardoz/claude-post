@@ -10,6 +10,8 @@ A Model Context Protocol (MCP) server that provides a seamless email management 
 * 🛠️ **Bug Fixes**: Fixed IMAP state errors when fetching email content
 * 📋 **Improved Logging**: Enhanced logging for better troubleshooting
 * 🔄 **Robust Email Operations**: Better handling of mailbox selection across all operations
+* 🌐 **Unicode Support**: Fixed encoding issues to properly handle international characters in emails
+* 🔔 **Enhanced Error Handling**: Better handling of cancellation notifications and timeouts
 
 ## Features & Demo
 
@@ -202,6 +204,42 @@ claude-post/
 
 The application logs detailed information to `email_client.log`. Check this file for debugging information and error messages.
 
+## Windows-Specific Setup Notes
+
+If running on Windows:
+
+1. In PowerShell, remember that command chaining works differently:
+   ```powershell
+   # Instead of using && like in bash:
+   cd src/email_client ; python server.py
+   ```
+
+2. If using the Windows command line, set the console to UTF-8 mode before running:
+   ```cmd
+   chcp 65001
+   ```
+
+3. If you encounter Unicode encoding errors, they should be fixed in the latest version, but you may need to add these environment variables to your system:
+   ```powershell
+   $env:PYTHONIOENCODING = "utf-8"
+   ```
+
+4. When specifying paths in the Claude Desktop configuration on Windows, use forward slashes or escaped backslashes:
+   ```json
+   {
+     "mcpServers": {
+       "email": {
+         "command": "C:/path/to/claude-post/.venv/Scripts/python.exe",
+         "args": [
+           "-m",
+           "email_client"
+         ],
+         "cwd": "C:/path/to/claude-post"
+       }
+     }
+   }
+   ```
+
 ## Troubleshooting
 
 If you encounter issues:
@@ -209,6 +247,8 @@ If you encounter issues:
 2. Ensure your email server supports IMAP and SMTP access
 3. Verify your credentials in the `.env` file
 4. Make sure the proper mailbox is selected before operations
+5. On Windows, check if your console is using UTF-8 encoding (code page 65001)
+6. If you see Unicode encoding errors in email content, update to the latest version which includes fixes
 
 ## License
 

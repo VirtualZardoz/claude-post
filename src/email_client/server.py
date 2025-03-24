@@ -8,18 +8,102 @@ import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import os
+import sys
 from dotenv import load_dotenv
 from mcp.server.models import InitializationOptions
 import mcp.types as types
 from mcp.server import NotificationOptions, Server
 import mcp.server.stdio
+import json
+import io
+
+# Set up UTF-8 for stdout and stderr before any other imports or code
+try:
+    # Force UTF-8 encoding for stdout and stderr
+    if sys.platform == "win32":
+        import codecs
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='backslashreplace')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='backslashreplace')
+        
+        # Try to set the console code page to UTF-8
+        os.system('chcp 65001 > nul')
+except Exception as e:
+    pass  # If this fails, continue anyway
 
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    filename='email_client.log'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("email_client.log", encoding='utf-8')
+    ]
 )
+
+# Add some basic diagnostic information
+print(f"Python version: {sys.version}", file=sys.stderr)
+print(f"Current directory: {os.getcwd()}", file=sys.stderr)
+print(f"Sys path: {sys.path}", file=sys.stderr)
+
+# Patch the MCP session to handle cancelled notifications
+# This is a safer approach than trying to register a notification type
+try:
+    # The correct module for SessionHandler is 'mcp.shared.session'
+    from mcp.shared import session
+    
+    # Check if the ServerSession class exists and has the _receive_loop method
+    if hasattr(session, 'ServerSession') and hasattr(session.ServerSession, '_receive_loop'):
+        original_receive_loop = session.ServerSession._receive_loop
+        
+        async def patched_receive_loop(self):
+            try:
+                return await original_receive_loop(self)
+            except Exception as e:
+                error_str = str(e)
+                # Check if this is the cancellation notification error
+                if "notifications/cancelled" in error_str:
+                    print(f"Handling cancelled notification gracefully: {error_str}", file=sys.stderr)
+                    # Just continue the loop instead of crashing
+                    return await self._receive_loop()
+                # Log other errors for debugging
+                print(f"Error in MCP session: {error_str}", file=sys.stderr)
+                # Re-raise other errors
+                raise
+        
+        # Apply the patch
+        session.ServerSession._receive_loop = patched_receive_loop
+        print("Successfully patched MCP to handle cancellation notifications", file=sys.stderr)
+    else:
+        # Try alternative patch for newer MCP versions
+        # Look for RequestResponder class which might handle the notifications
+        if hasattr(session, 'RequestResponder'):
+            print("Attempting to patch RequestResponder for handling cancellations", file=sys.stderr)
+            # Implementation details would depend on the exact structure
+            
+            # Add a basic error handler for all message processing
+            original_methods = {}
+            for method_name in dir(session.RequestResponder):
+                if method_name.startswith('_process_') and callable(getattr(session.RequestResponder, method_name)):
+                    original_method = getattr(session.RequestResponder, method_name)
+                    
+                    async def safe_process_wrapper(self, *args, **kwargs):
+                        try:
+                            return await original_method(self, *args, **kwargs)
+                        except Exception as e:
+                            error_str = str(e)
+                            if "notifications/cancelled" in error_str:
+                                print(f"Handling cancelled notification in RequestResponder: {error_str}", file=sys.stderr)
+                                return None  # Or other appropriate default return
+                            raise
+                    
+                    setattr(session.RequestResponder, method_name, safe_process_wrapper)
+                    original_methods[method_name] = original_method
+                    
+            print(f"Patched RequestResponder methods: {list(original_methods.keys())}", file=sys.stderr)
+except Exception as patch_err:
+    print(f"Warning: Could not patch MCP for cancellation messages: {str(patch_err)}", file=sys.stderr)
+    print(f"MCP module structure: {dir(mcp.shared)}", file=sys.stderr) 
+    # Continue anyway, as this is just an optimization
 
 # Load environment variables from .env file
 load_dotenv()
@@ -39,6 +123,43 @@ MAX_EMAILS = 100
 
 server = Server("email")
 
+# Function to safely decode text with proper Unicode handling
+def safe_decode(text, encoding='utf-8'):
+    """Safely decode text to handle Unicode characters."""
+    if isinstance(text, bytes):
+        try:
+            return text.decode(encoding, errors='replace')
+        except Exception:
+            return text.decode('utf-8', errors='replace')
+    return text
+
+# Add a safe text serialization function to prevent encoding errors
+def safe_text_serialization(text):
+    """Ensure text can be safely serialized to JSON without encoding errors."""
+    if not isinstance(text, str):
+        return str(text)
+    
+    # Replace problematic Unicode characters
+    result = text
+    for char, replacement in {
+        '\u202f': ' ',  # narrow no-break space
+        '\ufeff': '',   # zero width no-break space
+        '\u2028': ' ',  # line separator
+        '\u2029': ' '   # paragraph separator
+    }.items():
+        result = result.replace(char, replacement)
+    
+    return result
+
+# Patch the text content type to sanitize text
+original_text_content_init = types.TextContent.__init__
+def patched_text_content_init(self, type: str, text: str):
+    # Sanitize the text to prevent encoding errors
+    safe_text = safe_text_serialization(text)
+    original_text_content_init(self, type=type, text=safe_text)
+types.TextContent.__init__ = patched_text_content_init
+
+# Enhance decode_header_safely to handle more problematic characters
 def decode_header_safely(header_value: str) -> str:
     """Safely decode email headers that may contain encoded words or special characters."""
     try:
@@ -54,10 +175,14 @@ def decode_header_safely(header_value: str) -> str:
                 else:
                     part = part.decode('utf-8', errors='replace')
             result += str(part)
-        return result
+        
+        # Further sanitize the result
+        return safe_text_serialization(result)
     except Exception as e:
         logging.error(f"Error decoding header: {str(e)}")
-        return header_value or ""
+        if header_value:
+            return safe_text_serialization(header_value)
+        return ""
 
 def format_email_summary(msg_data: tuple) -> dict:
     """Format an email message into a summary dict with basic information."""
@@ -81,29 +206,29 @@ def format_email_content(msg_data: tuple) -> dict:
         for part in email_body.walk():
             if part.get_content_type() == "text/plain":
                 try:
-                    body = part.get_payload(decode=True).decode('utf-8', errors='replace')
+                    body = safe_decode(part.get_payload(decode=True))
                     break
                 except Exception as e:
                     logging.error(f"Error decoding email body: {str(e)}")
-                    body = part.get_payload(decode=True).decode('utf-8', errors='replace')
+                    body = safe_decode(part.get_payload(decode=True))
             elif part.get_content_type() == "text/html":
                 # If no plain text found, use HTML content
                 if not body:
                     try:
-                        body = part.get_payload(decode=True).decode('utf-8', errors='replace')
+                        body = safe_decode(part.get_payload(decode=True))
                     except Exception as e:
                         logging.error(f"Error decoding HTML body: {str(e)}")
-                        body = part.get_payload(decode=True).decode('utf-8', errors='replace')
+                        body = safe_decode(part.get_payload(decode=True))
     else:
         # Handle non-multipart messages
         try:
-            body = email_body.get_payload(decode=True).decode('utf-8', errors='replace')
+            body = safe_decode(email_body.get_payload(decode=True))
         except Exception as e:
             logging.error(f"Error decoding non-multipart body: {str(e)}")
-            body = email_body.get_payload(decode=True).decode('utf-8', errors='replace')
+            body = safe_decode(email_body.get_payload(decode=True))
     
-    # Replace any potentially problematic characters
-    body = body.replace('\ufeff', '')
+    # Sanitize the body text
+    body = safe_text_serialization(body)
     
     return {
         "from": decode_header_safely(email_body.get("From", "Unknown")),
@@ -683,88 +808,153 @@ async def handle_call_tool(
                 )]
                 
         elif name == "search-emails":
-            # Get folder parameter
-            folder = arguments.get("folder", "inbox")
+            folder = arguments.get("folder", "inbox").strip()
+            start_date = arguments.get("start_date", "")
+            end_date = arguments.get("end_date", "")
+            keyword = arguments.get("keyword", "")
             
-            # Select the appropriate mailbox
-            await ensure_mailbox_selected(mail, folder)
-            
-            # Get optional parameters
-            start_date = arguments.get("start_date")
-            end_date = arguments.get("end_date")
-            keyword = arguments.get("keyword")
-            
-            # If no dates provided, default to last 7 days
-            if not start_date:
-                start_date = datetime.now() - timedelta(days=7)
-                start_date = start_date.strftime("%d-%b-%Y")
-            else:
-                start_date = datetime.strptime(start_date, "%Y-%m-%d").strftime("%d-%b-%Y")
-                
-            # Always convert end_date to datetime object for consistent handling
-            if not end_date:
-                end_date_obj = datetime.now()
-                end_date = end_date_obj.strftime("%d-%b-%Y")
-            else:
-                # Convert end_date to datetime object
-                end_date_obj = datetime.strptime(end_date, "%Y-%m-%d")
-                end_date = end_date_obj.strftime("%d-%b-%Y")
-            
-            # Build search criteria
-            if start_date == end_date:
-                # If searching for a single day
-                search_criteria = f'ON "{start_date}"'
-            else:
-                # Calculate next day using the already converted end_date_obj
-                next_day = (end_date_obj + timedelta(days=1)).strftime("%d-%b-%Y")
-                search_criteria = f'SINCE "{start_date}" BEFORE "{next_day}"'
-                
-            if keyword:
-                # Fix: Properly combine keyword search with date criteria
-                keyword_criteria = f'(OR SUBJECT "{keyword}" BODY "{keyword}")'
-                search_criteria = f'({keyword_criteria} {search_criteria})'
-            
-            logging.debug(f"Search criteria: {search_criteria}")  # Add debug logging
+            # Connect to IMAP server
+            mail = imaplib.IMAP4_SSL(EMAIL_CONFIG["imap_server"])
+            mail.login(EMAIL_CONFIG["email"], EMAIL_CONFIG["password"])
             
             try:
-                async with asyncio.timeout(SEARCH_TIMEOUT):
-                    email_list = await search_emails_async(mail, search_criteria)
+                # Select the folder to search in
+                await ensure_mailbox_selected(mail, folder)
+                
+                # Format dates for IMAP search
+                if start_date:
+                    try:
+                        dt = datetime.strptime(start_date, "%Y-%m-%d")
+                        start_date = dt.strftime("%d-%b-%Y")
+                    except ValueError:
+                        return [types.TextContent(
+                            type="text",
+                            text=f"Invalid start date format: {start_date}. Use YYYY-MM-DD format."
+                        )]
+                else:
+                    # Default to 7 days ago if no start date
+                    dt = datetime.now() - timedelta(days=7)
+                    start_date = dt.strftime("%d-%b-%Y")
+                
+                if end_date:
+                    try:
+                        dt = datetime.strptime(end_date, "%Y-%m-%d")
+                        # Add one day to make the search inclusive
+                        next_day = (dt + timedelta(days=1)).strftime("%d-%b-%Y")
+                    except ValueError:
+                        return [types.TextContent(
+                            type="text",
+                            text=f"Invalid end date format: {end_date}. Use YYYY-MM-DD format."
+                        )]
+                else:
+                    # Default to tomorrow if no end date
+                    dt = datetime.now() + timedelta(days=1)
+                    next_day = dt.strftime("%d-%b-%Y")
+                
+                # Build the search criteria
+                search_criteria = f'SINCE "{start_date}" BEFORE "{next_day}"'
+                
+                if keyword:
+                    search_criteria = f'({search_criteria}) SUBJECT "{keyword}"'
+                
+                # Very short timeout to ensure we return before client timeouts 
+                search_timeout = 10  # 10 seconds maximum
+                
+                try:
+                    # Limit the number of emails right in the IMAP search to minimize processing
+                    email_list = []
                     
-                if not email_list:
+                    async with asyncio.timeout(search_timeout):
+                        # Search for emails
+                        loop = asyncio.get_event_loop()
+                        _, messages = await loop.run_in_executor(None, lambda: mail.search(None, search_criteria))
+                        
+                        if not messages[0]:
+                            return [types.TextContent(
+                                type="text",
+                                text=f"No emails found in '{folder}' matching your search criteria."
+                            )]
+                        
+                        # Get the last 20 emails at most to ensure quick response
+                        ids = messages[0].split()[-20:]
+                        
+                        # Fetch basic headers for each email (faster than getting full content)
+                        for email_id in ids:
+                            try:
+                                # Use FETCH with specific headers to speed up response
+                                _, header_data = await loop.run_in_executor(
+                                    None, 
+                                    lambda: mail.fetch(email_id, '(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])')
+                                )
+                                
+                                # Parse header data
+                                raw_headers = header_data[0][1]
+                                if isinstance(raw_headers, bytes):
+                                    raw_headers = raw_headers.decode('utf-8', errors='replace')
+                                
+                                # Extract headers
+                                header_dict = {}
+                                for line in raw_headers.split('\r\n'):
+                                    if ':' in line:
+                                        key, value = line.split(':', 1)
+                                        header_dict[key.strip().lower()] = value.strip()
+                                
+                                # Add to results
+                                email_list.append({
+                                    "id": email_id.decode('utf-8', errors='replace'),
+                                    "from": header_dict.get('from', 'Unknown'),
+                                    "date": header_dict.get('date', 'Unknown'),
+                                    "subject": header_dict.get('subject', 'No Subject')
+                                })
+                            except Exception:
+                                # Skip problematic emails
+                                continue
+                    
+                    # Format the results
+                    if not email_list:
+                        return [types.TextContent(
+                            type="text",
+                            text=f"No emails could be retrieved from '{folder}' matching your search criteria."
+                        )]
+                    
+                    result_text = f"Found emails in '{folder}':\n\n"
+                    result_text += "ID | From | Date | Subject\n"
+                    result_text += "-" * 80 + "\n"
+                    
+                    for email_data in email_list:
+                        try:
+                            result_text += f"{email_data['id']} | {email_data['from']} | {email_data['date']} | {email_data['subject']}\n"
+                        except Exception:
+                            # Skip problematic formatting
+                            continue
+                    
+                    result_text += f"\nUse get-email-content with an email ID and folder='{folder}' to view the full content of a specific email."
+                    
+                    # Ensure the text is properly encoded
+                    result_text = result_text.encode('utf-8', errors='replace').decode('utf-8')
+                    
                     return [types.TextContent(
                         type="text",
-                        text=f"No emails found in '{folder}' matching the criteria."
+                        text=result_text
                     )]
-                
-                # Format the results as a table
-                result_text = f"Found emails in '{folder}':\n\n"
-                result_text += "ID | From | Date | Subject\n"
-                result_text += "-" * 80 + "\n"
-                
-                for email in email_list:
-                    # Sanitize the result to ensure no encoding issues
-                    for key in ['from', 'subject']:
-                        if key in email:
-                            email[key] = str(email[key]).replace('\ufeff', '')
-                    
-                    result_text += f"{email['id']} | {email['from']} | {email['date']} | {email['subject']}\n"
-                
-                result_text += f"\nUse get-email-content with an email ID and folder='{folder}' to view the full content of a specific email."
-                
-                # Ensure the result text doesn't have any problematic characters
-                result_text = result_text.encode('utf-8', errors='replace').decode('utf-8')
-                
-                return [types.TextContent(
-                    type="text",
-                    text=result_text
-                )]
-                
-            except asyncio.TimeoutError:
-                return [types.TextContent(
-                    type="text",
-                    text="Search operation timed out. Please try with a more specific search criteria."
-                )]
-                
+                except asyncio.TimeoutError:
+                    return [types.TextContent(
+                        type="text",
+                        text=f"The search operation is taking longer than expected. Please try again with more specific search criteria to narrow down the results."
+                    )]
+                except Exception as e:
+                    return [types.TextContent(
+                        type="text",
+                        text=f"Error during search operation: {str(e)}"
+                    )]
+            finally:
+                # Clean up the connection
+                try:
+                    mail.close()
+                    mail.logout()
+                except:
+                    pass
+        
         elif name == "get-email-content":
             email_id = arguments.get("email_id")
             folder = arguments.get("folder", "inbox")
@@ -856,34 +1046,38 @@ async def handle_call_tool(
             pass
 
 async def main():
-    # Set console encoding to UTF-8 to handle special characters
-    if os.name == 'nt':  # Windows
-        try:
-            # Try to set console encoding to UTF-8 on Windows
-            import sys
-            import codecs
-            sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
-            sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+    # Initialize and set up the environment
+    try:
+        # Set the environment encoding to UTF-8 for Windows
+        if sys.platform == 'win32':
             # Set console code page to UTF-8
             os.system('chcp 65001 > nul')
             logging.info("Successfully set console encoding to UTF-8")
-        except Exception as e:
-            logging.error(f"Error setting console encoding: {str(e)}")
+    except Exception as e:
+        logging.error(f"Error setting console encoding: {str(e)}")
+        print(f"Error during initialization: {str(e)}", file=sys.stderr)
 
-    # Run the server using stdin/stdout streams
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            InitializationOptions(
-                server_name="email",
-                server_version="0.1.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
+    # Run the server using stdin/stdout streams with proper encoding
+    try:
+        async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+            await server.run(
+                read_stream,
+                write_stream,
+                InitializationOptions(
+                    server_name="email",
+                    server_version="0.1.0",
+                    capabilities=server.get_capabilities(
+                        notification_options=NotificationOptions(),
+                        experimental_capabilities={},
+                    ),
                 ),
-            ),
-        )
+            )
+    except UnicodeEncodeError as e:
+        logging.error(f"Unicode encode error: {e}")
+        print(f"Unicode encoding error: {e}. This is likely due to special characters in email content.", file=sys.stderr)
+    except Exception as e:
+        logging.error(f"Unexpected error in server: {e}")
+        print(f"Unexpected error in server: {e}", file=sys.stderr)
 
 if __name__ == "__main__":
     asyncio.run(main())
