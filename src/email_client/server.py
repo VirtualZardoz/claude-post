@@ -39,15 +39,35 @@ MAX_EMAILS = 100
 
 server = Server("email")
 
+def decode_header_safely(header_value: str) -> str:
+    """Safely decode email headers that may contain encoded words or special characters."""
+    try:
+        decoded_parts = email.header.decode_header(header_value or "")
+        result = ""
+        for part, encoding in decoded_parts:
+            if isinstance(part, bytes):
+                if encoding:
+                    try:
+                        part = part.decode(encoding, errors='replace')
+                    except (LookupError, UnicodeDecodeError):
+                        part = part.decode('utf-8', errors='replace')
+                else:
+                    part = part.decode('utf-8', errors='replace')
+            result += str(part)
+        return result
+    except Exception as e:
+        logging.error(f"Error decoding header: {str(e)}")
+        return header_value or ""
+
 def format_email_summary(msg_data: tuple) -> dict:
     """Format an email message into a summary dict with basic information."""
     email_body = email.message_from_bytes(msg_data[0][1])
     
     return {
         "id": msg_data[0][0].split()[0].decode(),  # Get the email ID
-        "from": email_body.get("From", "Unknown"),
+        "from": decode_header_safely(email_body.get("From", "Unknown")),
         "date": email_body.get("Date", "Unknown"),
-        "subject": email_body.get("Subject", "No Subject"),
+        "subject": decode_header_safely(email_body.get("Subject", "No Subject")),
     }
 
 def format_email_content(msg_data: tuple) -> dict:
@@ -60,21 +80,36 @@ def format_email_content(msg_data: tuple) -> dict:
         # Handle multipart messages
         for part in email_body.walk():
             if part.get_content_type() == "text/plain":
-                body = part.get_payload(decode=True).decode()
-                break
+                try:
+                    body = part.get_payload(decode=True).decode('utf-8', errors='replace')
+                    break
+                except Exception as e:
+                    logging.error(f"Error decoding email body: {str(e)}")
+                    body = part.get_payload(decode=True).decode('utf-8', errors='replace')
             elif part.get_content_type() == "text/html":
                 # If no plain text found, use HTML content
                 if not body:
-                    body = part.get_payload(decode=True).decode()
+                    try:
+                        body = part.get_payload(decode=True).decode('utf-8', errors='replace')
+                    except Exception as e:
+                        logging.error(f"Error decoding HTML body: {str(e)}")
+                        body = part.get_payload(decode=True).decode('utf-8', errors='replace')
     else:
         # Handle non-multipart messages
-        body = email_body.get_payload(decode=True).decode()
+        try:
+            body = email_body.get_payload(decode=True).decode('utf-8', errors='replace')
+        except Exception as e:
+            logging.error(f"Error decoding non-multipart body: {str(e)}")
+            body = email_body.get_payload(decode=True).decode('utf-8', errors='replace')
+    
+    # Replace any potentially problematic characters
+    body = body.replace('\ufeff', '')
     
     return {
-        "from": email_body.get("From", "Unknown"),
-        "to": email_body.get("To", "Unknown"),
+        "from": decode_header_safely(email_body.get("From", "Unknown")),
+        "to": decode_header_safely(email_body.get("To", "Unknown")),
         "date": email_body.get("Date", "Unknown"),
-        "subject": email_body.get("Subject", "No Subject"),
+        "subject": decode_header_safely(email_body.get("Subject", "No Subject")),
         "content": body
     }
 
@@ -135,6 +170,8 @@ async def send_email_async(
         if cc_addresses:
             msg['Cc'] = ', '.join(cc_addresses)
         msg['Subject'] = subject
+        msg['Date'] = email.utils.formatdate(localtime=True)
+        msg['Message-ID'] = email.utils.make_msgid(domain=EMAIL_CONFIG["email"].split('@')[1])
         
         # Add body
         msg.attach(MIMEText(content, 'plain', 'utf-8'))
@@ -168,17 +205,219 @@ async def send_email_async(
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, send_sync)
         
+        # After sending via SMTP, save a copy to the Sent folder via IMAP with timeout
+        try:
+            logging.debug("Attempting to save copy of email to Sent folder")
+            
+            # Prepare the message for IMAP append with delivery flags
+            email_str = msg.as_string().encode('utf-8')
+            
+            # Create a task for the IMAP operations with a timeout
+            async def save_to_sent_folder():
+                try:
+                    # Connect to IMAP server
+                    mail = imaplib.IMAP4_SSL(EMAIL_CONFIG["imap_server"])
+                    mail.login(EMAIL_CONFIG["email"], EMAIL_CONFIG["password"])
+                    
+                    # Check if this is Infomaniak (based on server name)
+                    is_infomaniak = "infomaniak" in EMAIL_CONFIG["imap_server"].lower()
+                    logging.debug(f"Server identified as Infomaniak: {is_infomaniak}")
+                    
+                    # Log all folders for debugging
+                    _, folder_list = mail.list()
+                    logging.debug("Available folders:")
+                    for folder in folder_list:
+                        folder_str = folder.decode('utf-8') if isinstance(folder, bytes) else str(folder)
+                        logging.debug(f"  - {folder_str}")
+                    
+                    # Define potential sent folder names based on provider
+                    sent_folder_candidates = []
+                    
+                    if is_infomaniak:
+                        # Infomaniak-specific folders - expanded list based on common paths
+                        sent_folder_candidates = [
+                            'Sent',
+                            'Sent Messages',
+                            'Sent Items',
+                            'INBOX.Sent',
+                            'INBOX.Sent Messages',
+                            'INBOX.Sent Items',
+                            '"Sent Messages"',
+                            '"Sent"',
+                            '"Sent Items"',
+                            'INBOX/"Sent Messages"',
+                            'INBOX/"Sent"',
+                            'INBOX/"Sent Items"',
+                            # Infomaniak format with slashes
+                            '/Sent Messages',
+                            '/Sent',
+                            '/Sent Items',
+                        ]
+                    else:
+                        # General folder names for other providers
+                        sent_folder_candidates = [
+                            'Sent', 
+                            '"Sent Messages"', 
+                            'Sent Items', 
+                            'SENT',
+                            '"Sent Mail"',
+                            'Sent Mail',
+                            '"Sent Items"',
+                            'OUTBOX',
+                            'Outbox',
+                            'Sent-Mail'
+                        ]
+                    
+                    # Try direct matching with folder names first
+                    sent_folder = None
+                    for folder_name in sent_folder_candidates:
+                        try:
+                            logging.debug(f"Trying to select folder: {folder_name}")
+                            status, _ = mail.select(folder_name, readonly=True)
+                            if status == 'OK':
+                                sent_folder = folder_name
+                                mail.close()  # Close selected folder
+                                logging.debug(f"Successfully matched sent folder: {sent_folder}")
+                                break
+                        except Exception as e:
+                            logging.debug(f"Failed to select folder {folder_name}: {str(e)}")
+                    
+                    # If we still didn't find the sent folder, try parsing the folder list
+                    if not sent_folder:
+                        logging.debug("Trying to parse folder list to find sent folder")
+                        for folder in folder_list:
+                            folder_str = folder.decode('utf-8') if isinstance(folder, bytes) else str(folder)
+                            
+                            # Look for sent-related keywords in the folder string
+                            if any(keyword in folder_str.lower() for keyword in ['sent', 'envoy']):
+                                # Extract the folder name - usually in quotes
+                                parts = folder_str.split('"')
+                                if len(parts) > 2:
+                                    sent_folder = parts[1].strip()
+                                    logging.debug(f"Found sent folder from parsing: {sent_folder}")
+                                    break
+                    
+                    # Last resort fallback
+                    if not sent_folder:
+                        if is_infomaniak:
+                            # Default for Infomaniak based on common patterns
+                            sent_folder = 'Sent' 
+                            logging.debug(f"Using Infomaniak default sent folder: {sent_folder}")
+                        else:
+                            # Default for other providers
+                            sent_folder = "Sent"
+                            logging.debug(f"Using default sent folder: {sent_folder}")
+                    
+                    logging.debug(f"Final selected sent folder: {sent_folder}")
+                    
+                    # Try multiple approaches to save the message
+                    success = False
+                    errors = []
+                    
+                    # Try all these variants with proper error handling
+                    append_attempts = [
+                        # Standard approach
+                        lambda: mail.append(sent_folder, '\\Seen', None, email_str),
+                        # No flags
+                        lambda: mail.append(sent_folder, '', None, email_str),
+                        # With quotes if needed
+                        lambda: mail.append(f'"{sent_folder}"', '\\Seen', None, email_str) 
+                            if not sent_folder.startswith('"') and ' ' in sent_folder else None,
+                        # INBOX prefix
+                        lambda: mail.append(f'INBOX.{sent_folder}', '\\Seen', None, email_str) 
+                            if not sent_folder.startswith('INBOX') else None,
+                        # Try with Infomaniak format if applicable
+                        lambda: mail.append(f'/INBOX/Sent', '\\Seen', None, email_str) 
+                            if is_infomaniak else None,
+                        lambda: mail.append(f'/Sent', '\\Seen', None, email_str) 
+                            if is_infomaniak else None,
+                        lambda: mail.append(f'/INBOX/Sent Messages', '\\Seen', None, email_str) 
+                            if is_infomaniak else None,
+                        lambda: mail.append(f'/INBOX/"Sent Messages"', '\\Seen', None, email_str) 
+                            if is_infomaniak else None,
+                    ]
+                    
+                    for i, attempt_fn in enumerate(append_attempts):
+                        try:
+                            result = attempt_fn()
+                            if result is None:
+                                # Skip this attempt as it wasn't applicable
+                                continue
+                                
+                            if result and result[0] == 'OK':
+                                logging.debug(f"Successfully saved email to Sent folder (attempt {i+1})")
+                                success = True
+                                break
+                            elif result:
+                                errors.append(f"Attempt {i+1} returned: {result}")
+                        except Exception as e:
+                            errors.append(f"Attempt {i+1} failed: {str(e)}")
+                            logging.debug(f"Append attempt {i+1} failed: {str(e)}")
+                    
+                    if not success:
+                        logging.error(f"All attempts to save to Sent folder failed: {', '.join(errors)}")
+                        logging.error("The email was sent successfully, but could not be saved to the Sent folder")
+                    
+                    # Close the connection
+                    mail.logout()
+                    
+                except Exception as e:
+                    logging.error(f"Error in save_to_sent_folder task: {str(e)}")
+            
+            # Run the save operation with a 10-second timeout
+            try:
+                await asyncio.wait_for(save_to_sent_folder(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logging.error("Timeout while saving to Sent folder - the email was sent but saving to Sent folder failed")
+            
+        except Exception as e:
+            logging.error(f"Error saving to Sent folder: {str(e)}")
+            # Don't raise the exception, as the email was successfully sent
+            # This is just a secondary operation
+        
+        # Return without waiting for the save operation to complete
+        return
+            
     except Exception as e:
         logging.error(f"Error in send_email_async: {str(e)}")
-        raise
+        raise Exception(f"Failed to send email: {str(e)}")
 
 async def ensure_mailbox_selected(mail: imaplib.IMAP4_SSL, mailbox: str = "inbox") -> None:
     """Ensure a mailbox is selected before performing IMAP operations."""
     loop = asyncio.get_event_loop()
     try:
         logging.debug(f"Selecting mailbox: {mailbox}")
-        await loop.run_in_executor(None, lambda: mail.select(mailbox))
-        logging.debug(f"Successfully selected mailbox: {mailbox}")
+        
+        # First check if we need to reestablish connection
+        try:
+            status = mail.noop()[0]
+            if status != 'OK':
+                logging.warning("IMAP connection appears broken, reconnecting...")
+                mail = imaplib.IMAP4_SSL(EMAIL_CONFIG["imap_server"])
+                mail.login(EMAIL_CONFIG["email"], EMAIL_CONFIG["password"])
+        except Exception as conn_err:
+            logging.warning(f"IMAP connection error: {str(conn_err)}, reconnecting...")
+            mail = imaplib.IMAP4_SSL(EMAIL_CONFIG["imap_server"])
+            mail.login(EMAIL_CONFIG["email"], EMAIL_CONFIG["password"])
+            
+        # Now select the mailbox
+        status, _ = await loop.run_in_executor(None, lambda: mail.select(mailbox))
+        
+        if status != 'OK':
+            logging.error(f"Failed to select mailbox {mailbox}: {status}")
+            # Try to select inbox as fallback
+            if mailbox.lower() != 'inbox':
+                logging.debug("Attempting to select INBOX as fallback")
+                fallback_status, _ = await loop.run_in_executor(None, lambda: mail.select('INBOX'))
+                if fallback_status != 'OK':
+                    raise Exception(f"Could not select mailbox {mailbox} or INBOX")
+                else:
+                    logging.debug("Successfully selected INBOX as fallback")
+            else:
+                raise Exception(f"Could not select mailbox {mailbox}")
+        else:
+            logging.debug(f"Successfully selected mailbox: {mailbox}")
+            
     except Exception as e:
         logging.error(f"Error selecting mailbox {mailbox}: {str(e)}")
         raise Exception(f"Error selecting mailbox: {str(e)}")
@@ -352,9 +591,44 @@ async def handle_call_tool(
                 
                 async with asyncio.timeout(SEARCH_TIMEOUT):
                     await send_email_async(to_addresses, subject, content, cc_addresses)
+                    # Try checking the sent folder to confirm message was saved there
+                    try:
+                        mail = imaplib.IMAP4_SSL(EMAIL_CONFIG["imap_server"])
+                        mail.login(EMAIL_CONFIG["email"], EMAIL_CONFIG["password"])
+                        
+                        # Try different variations of Sent folder names that might exist
+                        sent_folder_options = [
+                            'Sent', 
+                            'Sent Messages', 
+                            'INBOX.Sent',
+                            '"Sent Messages"',
+                            'Sent Items'
+                        ]
+                        
+                        for folder in sent_folder_options:
+                            try:
+                                status, _ = mail.select(folder, readonly=True)
+                                if status == 'OK':
+                                    logging.info(f"Successfully found and selected sent folder: {folder}")
+                                    # Check if there are any messages in this folder
+                                    _, msg_count = mail.search(None, 'ALL')
+                                    if msg_count[0]:
+                                        count = len(msg_count[0].split())
+                                        logging.info(f"Found {count} messages in sent folder '{folder}'")
+                                    else:
+                                        logging.info(f"No messages found in sent folder '{folder}'")
+                                    mail.close()
+                                    break
+                            except Exception as e:
+                                logging.debug(f"Could not select folder {folder}: {str(e)}")
+                        
+                        mail.logout()
+                    except Exception as check_err:
+                        logging.error(f"Error checking sent folder: {str(check_err)}")
+                    
                     return [types.TextContent(
                         type="text",
-                        text="Email sent successfully! Check email_client.log for detailed logs."
+                        text="Email sent successfully! The email was sent to the recipient(s). A copy should appear in your Sent folder, though this may depend on your email provider's configuration. If it doesn't appear in the Sent folder, the email was still delivered to the recipient(s). Check email_client.log for detailed logs."
                     )]
             except asyncio.TimeoutError:
                 logging.error("Operation timed out while sending email")
@@ -388,6 +662,13 @@ async def handle_call_tool(
                 # Format the results as a list
                 result_text = "Available email folders:\n\n"
                 for folder in folders:
+                    # Sanitize folder name to handle potential encoding issues
+                    try:
+                        folder = folder.encode('ascii', errors='replace').decode('ascii')
+                    except Exception as e:
+                        logging.warning(f"Error sanitizing folder name: {str(e)}")
+                        folder = str(folder).replace('\ufeff', '')
+                    
                     result_text += f"- {folder}\n"
                 
                 return [types.TextContent(
@@ -461,9 +742,17 @@ async def handle_call_tool(
                 result_text += "-" * 80 + "\n"
                 
                 for email in email_list:
+                    # Sanitize the result to ensure no encoding issues
+                    for key in ['from', 'subject']:
+                        if key in email:
+                            email[key] = str(email[key]).replace('\ufeff', '')
+                    
                     result_text += f"{email['id']} | {email['from']} | {email['date']} | {email['subject']}\n"
                 
                 result_text += f"\nUse get-email-content with an email ID and folder='{folder}' to view the full content of a specific email."
+                
+                # Ensure the result text doesn't have any problematic characters
+                result_text = result_text.encode('utf-8', errors='replace').decode('utf-8')
                 
                 return [types.TextContent(
                     type="text",
@@ -493,6 +782,11 @@ async def handle_call_tool(
                 async with asyncio.timeout(SEARCH_TIMEOUT):
                     email_content = await get_email_content_async(mail, email_id)
                     
+                # Sanitize the email content before returning
+                for key in ['from', 'to', 'subject', 'content']:
+                    if key in email_content:
+                        email_content[key] = str(email_content[key]).replace('\ufeff', '')
+                
                 result_text = (
                     f"From: {email_content['from']}\n"
                     f"To: {email_content['to']}\n"
@@ -500,6 +794,9 @@ async def handle_call_tool(
                     f"Subject: {email_content['subject']}\n"
                     f"\nContent:\n{email_content['content']}"
                 )
+                
+                # Additional sanitization
+                result_text = result_text.encode('utf-8', errors='replace').decode('utf-8')
                 
                 return [types.TextContent(
                     type="text",
@@ -559,6 +856,20 @@ async def handle_call_tool(
             pass
 
 async def main():
+    # Set console encoding to UTF-8 to handle special characters
+    if os.name == 'nt':  # Windows
+        try:
+            # Try to set console encoding to UTF-8 on Windows
+            import sys
+            import codecs
+            sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+            sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+            # Set console code page to UTF-8
+            os.system('chcp 65001 > nul')
+            logging.info("Successfully set console encoding to UTF-8")
+        except Exception as e:
+            logging.error(f"Error setting console encoding: {str(e)}")
+
     # Run the server using stdin/stdout streams
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
         await server.run(
